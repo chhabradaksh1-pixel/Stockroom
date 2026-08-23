@@ -11,6 +11,7 @@ import {
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell
 } from "recharts";
+import { supabase } from "./lib/supabase";
 
 /* ------------------------------------------------------------------ */
 /*  StockRoom — Inventory & Supplier Management                        */
@@ -19,26 +20,171 @@ import {
 /* ------------------------------------------------------------------ */
 
 const uid = (p = "") => p + Math.random().toString(36).slice(2, 9);
+const STOCKROOM_STATE_ID = "main";
+const cloudStateRef = { current: null };
+let cloudPersistTimer = null;
+let cloudWriteQueue = Promise.resolve();
+let cloudHydrated = false;
+let cloudLoadPromise = null;
+let lastPersistedSnapshot = null;
+let lastScheduledSnapshot = null;
 
-/* Persist a piece of state to the browser's localStorage so data
-   survives refreshes and restarts on this device. */
-function usePersistentState(key, initial) {
-  const [value, setValue] = useState(() => {
-    try {
-      const raw = window.localStorage.getItem("stockroom:" + key);
-      return raw !== null ? JSON.parse(raw) : initial;
-    } catch {
-      return initial;
-    }
+function normalizeCloudData(value) {
+  return value && typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+}
+
+const defaultShopState = {
+  name: "Your Boutique",
+  line1: "Shop No. 12, Main Market",
+  city: "Rudrapur, Uttarakhand 263153",
+  phone: "+91 90000 00000",
+  gstin: "",
+};
+
+function getDefaultStockroomState() {
+  return {
+    currency: "₹",
+    suppliers: seedSuppliers,
+    products: seedProducts,
+    movements: seedMovements,
+    pos: seedPOs,
+    invoices: seedInvoices,
+    leads: seedLeads,
+    shop: defaultShopState,
+  };
+}
+
+function mergeCloudState(value) {
+  const cloud = normalizeCloudData(value);
+  const defaults = getDefaultStockroomState();
+  return {
+    currency: cloud.currency ?? defaults.currency,
+    suppliers: Array.isArray(cloud.suppliers) ? cloud.suppliers : defaults.suppliers,
+    products: Array.isArray(cloud.products) ? cloud.products : defaults.products,
+    movements: Array.isArray(cloud.movements) ? cloud.movements : defaults.movements,
+    pos: Array.isArray(cloud.pos) ? cloud.pos : defaults.pos,
+    invoices: Array.isArray(cloud.invoices) ? cloud.invoices : defaults.invoices,
+    leads: Array.isArray(cloud.leads) ? cloud.leads : defaults.leads,
+    shop: { ...defaultShopState, ...(cloud.shop && typeof cloud.shop === "object" ? cloud.shop : {}) },
+  };
+}
+
+async function loadCloudState() {
+  if (cloudLoadPromise) return cloudLoadPromise;
+
+  cloudLoadPromise = (async () => {
+    const { data, error } = await supabase
+      .from("stockroom_state")
+      .select("data")
+      .eq("id", STOCKROOM_STATE_ID)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const nextCloudState = mergeCloudState(data && data.data);
+    cloudStateRef.current = nextCloudState;
+    cloudHydrated = true;
+    lastPersistedSnapshot = JSON.parse(JSON.stringify(nextCloudState));
+    return nextCloudState;
+  })().catch((error) => {
+    cloudHydrated = true;
+    cloudLoadPromise = null;
+    throw error;
   });
+
+  return cloudLoadPromise;
+}
+
+function scheduleCloudSave(nextState) {
+  if (!cloudHydrated) return;
+
+  const snapshot = {
+    currency: nextState.currency,
+    suppliers: nextState.suppliers,
+    products: nextState.products,
+    movements: nextState.movements,
+    pos: nextState.pos,
+    invoices: nextState.invoices,
+    leads: nextState.leads,
+    shop: nextState.shop,
+  };
+
+  const snapshotKey = JSON.stringify(snapshot);
+  if (snapshotKey === JSON.stringify(lastPersistedSnapshot)) {
+    return;
+  }
+  if (snapshotKey === JSON.stringify(lastScheduledSnapshot)) {
+    return;
+  }
+
+  lastScheduledSnapshot = snapshot;
+
+  if (cloudPersistTimer) {
+    clearTimeout(cloudPersistTimer);
+  }
+
+  const payload = { id: STOCKROOM_STATE_ID, data: snapshot };
+
+  cloudPersistTimer = setTimeout(() => {
+    cloudWriteQueue = cloudWriteQueue
+      .then(async () => {
+        const { error } = await supabase
+          .from("stockroom_state")
+          .upsert(payload, { onConflict: "id" });
+
+        if (error) {
+          console.error("[CLOUD] SAVE ERROR", error);
+          throw error;
+        }
+
+        lastPersistedSnapshot = JSON.parse(JSON.stringify(snapshot));
+        lastScheduledSnapshot = null;
+      })
+      .catch((error) => {
+        lastScheduledSnapshot = null;
+        console.error("[CLOUD] SAVE ERROR", error);
+        console.error("Failed to save StockRoom state to Supabase:", error);
+      });
+  }, 400);
+}
+
+function useSingleCloudState() {
+  const [state, setState] = useState(() => getDefaultStockroomState());
+  const [cloudReady, setCloudReady] = useState(false);
+
   useEffect(() => {
-    try {
-      window.localStorage.setItem("stockroom:" + key, JSON.stringify(value));
-    } catch {
-      /* storage full or unavailable — keep running in memory */
+    let active = true;
+
+    async function hydrate() {
+      try {
+        const cloudState = await loadCloudState();
+        if (!active) return;
+        setState(mergeCloudState(cloudState));
+      } catch (error) {
+        console.error("Failed to load StockRoom cloud state from Supabase:", error);
+        if (active) {
+          setState(getDefaultStockroomState());
+        }
+      } finally {
+        if (active) {
+          setCloudReady(true);
+        }
+      }
     }
-  }, [key, value]);
-  return [value, setValue];
+
+    hydrate();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!cloudReady) return;
+    scheduleCloudSave(state);
+  }, [cloudReady, state]);
+
+  return [state, setState, cloudReady];
 }
 
 const CATEGORIES = ["Fabric", "Lehenga", "Saree", "Suit / Kurta", "Gown / Anarkali", "Dupatta / Accessory", "Trims & Embellishment"];
@@ -214,18 +360,25 @@ function Empty({ icon: Icon, title, body, action }) {
 
 export default function App() {
   const [view, setView] = useState("dashboard");
-  const [cur, setCur] = usePersistentState("currency", "₹");
+  const [state, setState, cloudReady] = useSingleCloudState();
 
-  const [suppliers, setSuppliers] = usePersistentState("suppliers", seedSuppliers);
-  const [products, setProducts] = usePersistentState("products", seedProducts);
-  const [movements, setMovements] = usePersistentState("movements", seedMovements);
-  const [pos, setPOs] = usePersistentState("pos", seedPOs);
-  const [invoices, setInvoices] = usePersistentState("invoices", seedInvoices);
-  const [leads, setLeads] = usePersistentState("leads", seedLeads);
-  const [shop, setShop] = usePersistentState("shop", {
-    name: "Your Boutique", line1: "Shop No. 12, Main Market", city: "Rudrapur, Uttarakhand 263153",
-    phone: "+91 90000 00000", gstin: "",
-  });
+  const cur = state.currency;
+  const suppliers = state.suppliers;
+  const products = state.products;
+  const movements = state.movements;
+  const pos = state.pos;
+  const invoices = state.invoices;
+  const leads = state.leads;
+  const shop = state.shop;
+
+  const setCur = (next) => setState((prev) => ({ ...prev, currency: next }));
+  const setSuppliers = (next) => setState((prev) => ({ ...prev, suppliers: typeof next === "function" ? next(prev.suppliers) : next }));
+  const setProducts = (next) => setState((prev) => ({ ...prev, products: typeof next === "function" ? next(prev.products) : next }));
+  const setMovements = (next) => setState((prev) => ({ ...prev, movements: typeof next === "function" ? next(prev.movements) : next }));
+  const setPOs = (next) => setState((prev) => ({ ...prev, pos: typeof next === "function" ? next(prev.pos) : next }));
+  const setInvoices = (next) => setState((prev) => ({ ...prev, invoices: typeof next === "function" ? next(prev.invoices) : next }));
+  const setLeads = (next) => setState((prev) => ({ ...prev, leads: typeof next === "function" ? next(prev.leads) : next }));
+  const setShop = (next) => setState((prev) => ({ ...prev, shop: typeof next === "function" ? next(prev.shop) : next }));
 
   const supplierName = (id) => suppliers.find((s) => s.id === id)?.name ?? "—";
   const product = (id) => products.find((p) => p.id === id);
