@@ -6,12 +6,15 @@ import {
   Building2, Package, Wallet, Bell, ChevronRight, Boxes as BoxesIcon,
   Receipt, Printer, Store, ShoppingCart, User, IndianRupee,
   Contact, Phone, MessageCircle, Mail, MapPin, CalendarClock, UserPlus, StickyNote,
-  Download, Upload
+  Download, Upload, LogOut
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell
 } from "recharts";
 import { supabase } from "./lib/supabase";
+import { seedCustomers, getDefaultWhatsAppState, syncCustomersFromInvoices } from "./lib/whatsappData";
+import { WhatsAppModule } from "./components/WhatsAppModule";
+import { Auth } from "./components/Auth";
 
 /* ------------------------------------------------------------------ */
 /*  StockRoom — Inventory & Supplier Management                        */
@@ -21,20 +24,19 @@ import { supabase } from "./lib/supabase";
 
 const uid = (p = "") => p + Math.random().toString(36).slice(2, 9);
 const STOCKROOM_STATE_ID = "main";
-const cloudStateRef = { current: null };
 let cloudPersistTimer = null;
 let cloudWriteQueue = Promise.resolve();
-let cloudHydrated = false;
 let cloudLoadPromise = null;
-let lastPersistedSnapshot = null;
-let lastScheduledSnapshot = null;
+let lastPersistedSnapshotKey = null;
+let lastScheduledSnapshotKey = null;
+let cloudSaveGeneration = 0;
 
 function normalizeCloudData(value) {
   return value && typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
 }
 
 const defaultShopState = {
-  name: "Your Boutique",
+  name: "Rudrani Collection",
   line1: "Shop No. 12, Main Market",
   city: "Rudrapur, Uttarakhand 263153",
   phone: "+91 90000 00000",
@@ -49,8 +51,10 @@ function getDefaultStockroomState() {
     movements: seedMovements,
     pos: seedPOs,
     invoices: seedInvoices,
+    customers: seedCustomers,
     leads: seedLeads,
     shop: defaultShopState,
+    whatsapp: getDefaultWhatsAppState(),
   };
 }
 
@@ -64,110 +68,171 @@ function mergeCloudState(value) {
     movements: Array.isArray(cloud.movements) ? cloud.movements : defaults.movements,
     pos: Array.isArray(cloud.pos) ? cloud.pos : defaults.pos,
     invoices: Array.isArray(cloud.invoices) ? cloud.invoices : defaults.invoices,
+    customers: Array.isArray(cloud.customers) ? cloud.customers : defaults.customers,
     leads: Array.isArray(cloud.leads) ? cloud.leads : defaults.leads,
     shop: { ...defaultShopState, ...(cloud.shop && typeof cloud.shop === "object" ? cloud.shop : {}) },
+    whatsapp: cloud.whatsapp && typeof cloud.whatsapp === "object" ? { ...getDefaultWhatsAppState(), ...cloud.whatsapp, settings: { ...getDefaultWhatsAppState().settings, ...(cloud.whatsapp.settings || {}) } } : defaults.whatsapp,
   };
 }
 
-async function loadCloudState() {
+async function loadCloudState(userId) {
   if (cloudLoadPromise) return cloudLoadPromise;
 
   cloudLoadPromise = (async () => {
+    console.log("[CLOUD] LOAD START", { id: STOCKROOM_STATE_ID, userId });
     const { data, error } = await supabase
       .from("stockroom_state")
       .select("data")
       .eq("id", STOCKROOM_STATE_ID)
+      .eq("user_id", userId)
       .maybeSingle();
 
     if (error) throw error;
 
     const nextCloudState = mergeCloudState(data && data.data);
-    cloudStateRef.current = nextCloudState;
-    cloudHydrated = true;
-    lastPersistedSnapshot = JSON.parse(JSON.stringify(nextCloudState));
+    console.log("[CLOUD] LOAD SUCCESS", {
+      id: STOCKROOM_STATE_ID,
+      userId,
+      hasRow: Boolean(data),
+      productsCount: nextCloudState.products.length,
+    });
+    lastPersistedSnapshotKey = JSON.stringify(createCloudSnapshot(nextCloudState));
+    lastScheduledSnapshotKey = null;
     return nextCloudState;
-  })().catch((error) => {
-    cloudHydrated = true;
+  })().finally(() => {
     cloudLoadPromise = null;
-    throw error;
   });
 
   return cloudLoadPromise;
 }
 
-function scheduleCloudSave(nextState) {
-  if (!cloudHydrated) return;
-
-  const snapshot = {
+function createCloudSnapshot(nextState) {
+  return {
     currency: nextState.currency,
     suppliers: nextState.suppliers,
     products: nextState.products,
     movements: nextState.movements,
     pos: nextState.pos,
     invoices: nextState.invoices,
+    customers: nextState.customers,
     leads: nextState.leads,
     shop: nextState.shop,
+    whatsapp: nextState.whatsapp,
   };
+}
+
+function cancelPendingCloudSave() {
+  cloudSaveGeneration += 1;
+
+  if (cloudPersistTimer) {
+    clearTimeout(cloudPersistTimer);
+    cloudPersistTimer = null;
+  }
+
+  lastScheduledSnapshotKey = null;
+}
+
+function scheduleCloudSave(userId, nextState, onSaveError, onSaveSuccess) {
+  const snapshot = createCloudSnapshot(nextState);
 
   const snapshotKey = JSON.stringify(snapshot);
-  if (snapshotKey === JSON.stringify(lastPersistedSnapshot)) {
+  if (snapshotKey === lastPersistedSnapshotKey) {
     return;
   }
-  if (snapshotKey === JSON.stringify(lastScheduledSnapshot)) {
+  if (snapshotKey === lastScheduledSnapshotKey) {
     return;
   }
 
-  lastScheduledSnapshot = snapshot;
+  lastScheduledSnapshotKey = snapshotKey;
+  const saveGeneration = ++cloudSaveGeneration;
 
   if (cloudPersistTimer) {
     clearTimeout(cloudPersistTimer);
   }
 
-  const payload = { id: STOCKROOM_STATE_ID, data: snapshot };
+  const payload = { id: STOCKROOM_STATE_ID, user_id: userId, data: snapshot };
 
   cloudPersistTimer = setTimeout(() => {
     cloudWriteQueue = cloudWriteQueue
       .then(async () => {
-        const { error } = await supabase
+        if (saveGeneration !== cloudSaveGeneration) return;
+
+        console.log("[CLOUD] SAVE START", {
+          id: STOCKROOM_STATE_ID,
+          saveGeneration,
+          productsCount: payload.data.products.length,
+          hasAuthCloudTest: payload.data.products.some((product) => product.name === "AUTH-CLOUD-TEST" || product.sku === "AUTH-CLOUD-TEST"),
+        });
+
+        const result = await supabase
           .from("stockroom_state")
           .upsert(payload, { onConflict: "id" });
+        const { error } = result;
+
+        console.log("[CLOUD] SAVE RESULT", {
+          id: STOCKROOM_STATE_ID,
+          saveGeneration,
+          productsCount: payload.data.products.length,
+          result,
+        });
 
         if (error) {
           console.error("[CLOUD] SAVE ERROR", error);
           throw error;
         }
 
-        lastPersistedSnapshot = JSON.parse(JSON.stringify(snapshot));
-        lastScheduledSnapshot = null;
+        if (saveGeneration === cloudSaveGeneration) {
+          lastPersistedSnapshotKey = snapshotKey;
+          lastScheduledSnapshotKey = null;
+          onSaveSuccess?.();
+        }
       })
       .catch((error) => {
-        lastScheduledSnapshot = null;
+        if (saveGeneration === cloudSaveGeneration) {
+          lastScheduledSnapshotKey = null;
+          onSaveError?.(error);
+        }
         console.error("[CLOUD] SAVE ERROR", error);
         console.error("Failed to save StockRoom state to Supabase:", error);
       });
   }, 400);
 }
 
-function useSingleCloudState() {
+function useSingleCloudState(user, authLoading) {
   const [state, setState] = useState(() => getDefaultStockroomState());
   const [cloudReady, setCloudReady] = useState(false);
+  const [cloudError, setCloudError] = useState(null);
+  const [saveError, setSaveError] = useState(null);
+  const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
+    if (authLoading) return;
+
+    cancelPendingCloudSave();
+
+    if (!user) {
+      setCloudReady(false);
+      setCloudError(null);
+      setSaveError(null);
+      return;
+    }
+
     let active = true;
+    setCloudReady(false);
+    setCloudError(null);
+    setSaveError(null);
 
     async function hydrate() {
       try {
-        const cloudState = await loadCloudState();
+        const cloudState = await loadCloudState(user.id);
         if (!active) return;
         setState(mergeCloudState(cloudState));
+        setCloudReady(true);
       } catch (error) {
         console.error("Failed to load StockRoom cloud state from Supabase:", error);
         if (active) {
-          setState(getDefaultStockroomState());
-        }
-      } finally {
-        if (active) {
-          setCloudReady(true);
+          setCloudError(error);
+          setCloudReady(false);
         }
       }
     }
@@ -176,15 +241,16 @@ function useSingleCloudState() {
 
     return () => {
       active = false;
+      cancelPendingCloudSave();
     };
-  }, []);
+  }, [authLoading, user?.id, reloadToken]);
 
   useEffect(() => {
-    if (!cloudReady) return;
-    scheduleCloudSave(state);
-  }, [cloudReady, state]);
+    if (!user || !cloudReady || cloudError) return;
+    scheduleCloudSave(user.id, state, setSaveError, () => setSaveError(null));
+  }, [user, cloudReady, cloudError, state]);
 
-  return [state, setState, cloudReady];
+  return [state, setState, { cloudReady, cloudError, saveError, reloadCloud: () => setReloadToken((value) => value + 1) }];
 }
 
 const CATEGORIES = ["Fabric", "Lehenga", "Saree", "Suit / Kurta", "Gown / Anarkali", "Dupatta / Accessory", "Trims & Embellishment"];
@@ -360,7 +426,10 @@ function Empty({ icon: Icon, title, body, action }) {
 
 export default function App() {
   const [view, setView] = useState("dashboard");
-  const [state, setState, cloudReady] = useSingleCloudState();
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [state, setState, cloudStatus] = useSingleCloudState(user, authLoading);
+  const { cloudReady, cloudError, saveError, reloadCloud } = cloudStatus;
 
   const cur = state.currency;
   const suppliers = state.suppliers;
@@ -368,8 +437,10 @@ export default function App() {
   const movements = state.movements;
   const pos = state.pos;
   const invoices = state.invoices;
+  const customers = useMemo(() => syncCustomersFromInvoices(invoices, state.customers ?? seedCustomers), [invoices, state.customers]);
   const leads = state.leads;
   const shop = state.shop;
+  const whatsapp = state.whatsapp ?? getDefaultWhatsAppState();
 
   const setCur = (next) => setState((prev) => ({ ...prev, currency: next }));
   const setSuppliers = (next) => setState((prev) => ({ ...prev, suppliers: typeof next === "function" ? next(prev.suppliers) : next }));
@@ -377,11 +448,62 @@ export default function App() {
   const setMovements = (next) => setState((prev) => ({ ...prev, movements: typeof next === "function" ? next(prev.movements) : next }));
   const setPOs = (next) => setState((prev) => ({ ...prev, pos: typeof next === "function" ? next(prev.pos) : next }));
   const setInvoices = (next) => setState((prev) => ({ ...prev, invoices: typeof next === "function" ? next(prev.invoices) : next }));
+  const setCustomers = (next) => setState((prev) => ({ ...prev, customers: typeof next === "function" ? next(prev.customers) : next }));
   const setLeads = (next) => setState((prev) => ({ ...prev, leads: typeof next === "function" ? next(prev.leads) : next }));
   const setShop = (next) => setState((prev) => ({ ...prev, shop: typeof next === "function" ? next(prev.shop) : next }));
+  const setWhatsApp = (next) => setState((prev) => ({ ...prev, whatsapp: typeof next === "function" ? next(prev.whatsapp ?? getDefaultWhatsAppState()) : next }));
 
   const supplierName = (id) => suppliers.find((s) => s.id === id)?.name ?? "—";
   const product = (id) => products.find((p) => p.id === id);
+
+  /* --- auth setup --- */
+  useEffect(() => {
+    let active = true;
+
+    async function checkSession() {
+      try {
+        const { data } = await supabase.auth.getSession();
+        console.log("[AUTH] SESSION", data);
+        if (active) {
+          console.log("[AUTH] USER", data.session?.user ?? null);
+          setUser(data.session?.user ?? null);
+        }
+      } catch (error) {
+        console.error("Failed to check auth session:", error);
+        if (active) {
+          setUser(null);
+        }
+      } finally {
+        if (active) {
+          setAuthLoading(false);
+        }
+      }
+    }
+
+    checkSession();
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      console.log("[AUTH] SESSION", { event, session });
+      if (active) {
+        console.log("[AUTH] USER", session?.user ?? null);
+        setUser(session?.user ?? null);
+      }
+    });
+
+    return () => {
+      active = false;
+      subscription?.unsubscribe();
+    };
+  }, []);
+
+  async function handleLogout() {
+    try {
+      await supabase.auth.signOut();
+      setUser(null);
+    } catch (error) {
+      console.error("Logout failed:", error);
+    }
+  }
 
   /* --- derived metrics --- */
   const metrics = useMemo(() => {
@@ -455,10 +577,82 @@ export default function App() {
   function createInvoice(inv) {
     const number = nextInvoiceNumber();
     const record = { ...inv, id: uid("inv_"), number, date: today() };
-    setInvoices((prev) => [record, ...prev]);
+    setState((prev) => {
+      const nextInvoices = [record, ...prev.invoices];
+      return {
+        ...prev,
+        invoices: nextInvoices,
+        customers: syncCustomersFromInvoices(nextInvoices, prev.customers ?? seedCustomers),
+      };
+    });
     // Each billed line issues stock out of the room, logged against the invoice.
     inv.lines.forEach((l) => recordMovement({ productId: l.productId, type: "out", qty: l.qty, reason: "Boutique sale", ref: number, date: today() }));
     return record;
+  }
+
+  function getWhatsAppMessageKey({ customerId, customerName, companyName, phone, orderNumber, invoiceNumber, template = "Invoice delivery" }) {
+    const normalized = [customerId || "", customerName || "", companyName || "", phone || "", invoiceNumber || orderNumber || "", template || ""]
+      .map((part) => String(part).trim().toLowerCase().replace(/[^a-z0-9]/g, ""))
+      .filter(Boolean)
+      .join("_") || "wa_message";
+    return `wa_msg_${normalized}`;
+  }
+
+  function sendMockWhatsAppMessage({ customerName, companyName, phone, orderNumber, invoiceNumber, template = "Invoice delivery", customerId, invoiceId, orderId }) {
+    const invoiceRef = invoiceNumber || orderNumber || "—";
+    const messageKey = getWhatsAppMessageKey({ customerId, customerName, companyName, phone, orderNumber, invoiceNumber, template });
+    const payload = {
+      id: messageKey,
+      messageKey,
+      customerId: customerId || null,
+      invoiceId: invoiceId || null,
+      orderId: orderId || null,
+      customerName: customerName || "Customer",
+      companyName: companyName || customerName || "Business",
+      customerPhone: phone || "",
+      orderNumber: orderNumber || invoiceRef,
+      invoiceNumber: invoiceRef,
+      status: "Sending",
+      template,
+      messageType: "invoice",
+      eventText: `Invoice ${invoiceRef} sent via WhatsApp`,
+      createdAt: new Date().toISOString(),
+    };
+
+    setWhatsApp((prev) => {
+      const base = prev ?? getDefaultWhatsAppState();
+      const messages = Array.isArray(base.messages) ? base.messages : [];
+      const alreadyExists = messages.some((message) => {
+        const sameId = message.id === messageKey || message.messageKey === messageKey;
+        const sameInvoice = (message.invoiceNumber || message.orderNumber || "") === invoiceRef && (message.customerPhone || "") === (phone || "");
+        return sameId || sameInvoice;
+      });
+
+      if (alreadyExists) {
+        return base;
+      }
+
+      return {
+        ...getDefaultWhatsAppState(),
+        ...base,
+        messages: [payload, ...messages],
+      };
+    });
+
+    window.setTimeout(() => {
+      setWhatsApp((prev) => ({
+        ...getDefaultWhatsAppState(),
+        ...(prev ?? getDefaultWhatsAppState()),
+        messages: (prev?.messages || []).map((message) => message.id === messageKey || message.messageKey === messageKey ? { ...message, status: "Sent" } : message),
+      }));
+      window.setTimeout(() => {
+        setWhatsApp((prev) => ({
+          ...getDefaultWhatsAppState(),
+          ...(prev ?? getDefaultWhatsAppState()),
+          messages: (prev?.messages || []).map((message) => message.id === messageKey || message.messageKey === messageKey ? { ...message, status: "Delivered" } : message),
+        }));
+      }, 1200);
+    }, 1000);
   }
 
   /* --- CRM actions --- */
@@ -522,6 +716,52 @@ export default function App() {
     reader.readAsText(file);
   }
 
+  async function handleResetAllData() {
+    if (!window.confirm("Clear ALL saved data on this device (products, invoices, leads, everything) and start fresh with sample data? This cannot be undone.")) {
+      return;
+    }
+
+    try {
+      // Cancel any pending save timer to prevent stale saves after reset
+      cancelPendingCloudSave();
+
+      // Wait for any in-flight save to complete before proceeding
+      await cloudWriteQueue;
+
+      // Get the default/reset state
+      const resetState = getDefaultStockroomState();
+      const resetSnapshotKey = JSON.stringify(createCloudSnapshot(resetState));
+
+      // Perform the Supabase upsert to persist the reset state to cloud
+      const payload = { id: STOCKROOM_STATE_ID, user_id: user.id, data: resetState };
+      const { error } = await supabase
+        .from("stockroom_state")
+        .upsert(payload, { onConflict: "id" });
+
+      if (error) {
+        console.error("[CLOUD] RESET ERROR", error);
+        window.alert("Failed to reset data on cloud. Please try again.");
+        return;
+      }
+
+      // Update persist-tracking variables BEFORE state update.
+      // This ensures scheduleCloudSave won't queue a new save when it runs after the re-render.
+      lastPersistedSnapshotKey = resetSnapshotKey;
+      lastScheduledSnapshotKey = null;
+
+      // Update the React state (this triggers re-render and useEffect)
+      setState(resetState);
+
+      // Reload the page to complete the reset
+      setTimeout(() => {
+        window.location.reload();
+      }, 100);
+    } catch (error) {
+      console.error("[CLOUD] RESET ERROR", error);
+      window.alert("Failed to reset data. Please try again.");
+    }
+  }
+
   const overdueFollowUps = leads.filter((l) => !["Converted", "Dropped"].includes(l.stage) && l.nextFollowUp && l.nextFollowUp <= today()).length;
 
   const NAV = [
@@ -532,7 +772,55 @@ export default function App() {
     { id: "suppliers", label: "Suppliers", icon: Truck },
     { id: "purchasing", label: "Purchase orders", icon: ClipboardList, badge: metrics.openPO || null },
     { id: "crm", label: "Wholesale CRM", icon: Contact, badge: overdueFollowUps || null },
+    { id: "whatsapp", label: "WhatsApp", icon: MessageCircle },
   ];
+
+  // Show loading state while checking auth
+  if (authLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 font-sans text-slate-800">
+        <div className="text-center">
+          <div className="mb-4 h-3 w-3 rounded-full bg-teal-700 mx-auto animate-pulse"></div>
+          <p className="text-sm text-slate-500">Loading StockRoom...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Show login screen if not authenticated
+  if (!user) {
+    return <Auth />;
+  }
+
+  if (cloudError) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 font-sans text-slate-800">
+        <div className="w-full max-w-md rounded-2xl border border-rose-100 bg-white p-6 text-center shadow-sm">
+          <div className="mx-auto mb-3 grid h-10 w-10 place-items-center rounded-lg bg-rose-50 text-rose-600">
+            <AlertTriangle size={20} />
+          </div>
+          <h1 className="text-base font-semibold text-slate-900">Could not load StockRoom data</h1>
+          <p className="mt-2 text-sm text-slate-500">Your shared company data was not changed. Check the connection and try again.</p>
+          <button
+            onClick={reloadCloud}
+            className="mt-5 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-teal-800">
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!cloudReady) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 font-sans text-slate-800">
+        <div className="text-center">
+          <div className="mb-4 h-3 w-3 rounded-full bg-teal-700 mx-auto animate-pulse"></div>
+          <p className="text-sm text-slate-500">Loading shared company data...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-screen bg-slate-50 font-sans text-slate-800">
@@ -589,12 +877,12 @@ export default function App() {
             </label>
           </div>
           <button
-            onClick={() => {
-              if (window.confirm("Clear ALL saved data on this device (products, invoices, leads, everything) and start fresh with sample data? This cannot be undone.")) {
-                Object.keys(window.localStorage).filter((k) => k.startsWith("stockroom:")).forEach((k) => window.localStorage.removeItem(k));
-                window.location.reload();
-              }
-            }}
+            onClick={handleLogout}
+            className="mt-3 w-full inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-medium text-slate-500 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700">
+            <LogOut size={13} /> Sign Out
+          </button>
+          <button
+            onClick={handleResetAllData}
             className="mt-3 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-medium text-slate-400 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600">
             Reset all data
           </button>
@@ -614,6 +902,11 @@ export default function App() {
         </div>
 
         <main className="flex-1 px-4 py-6 sm:px-8">
+          {saveError && (
+            <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              StockRoom could not save the latest change to cloud. Your changes are still on this screen; please check the connection before refreshing.
+            </div>
+          )}
           {view === "dashboard" && (
             <Dashboard metrics={metrics} products={products} movements={movements} cur={cur} supplierName={supplierName} product={product} go={setView} />
           )}
@@ -636,6 +929,32 @@ export default function App() {
           )}
           {view === "crm" && (
             <CRM leads={leads} onSave={upsertLead} onDelete={removeLead} onTouch={logTouch} onStage={setLeadStage} onConvert={convertLead} go={setView} />
+          )}
+          {view === "whatsapp" && (
+            <WhatsAppModule
+              customers={customers}
+              invoices={invoices}
+              whatsapp={whatsapp}
+              shop={shop}
+              onSelectCustomer={(customer) => setCustomers((prev) => prev.map((item) => item.id === customer.id ? customer : item))}
+              onSendInvoice={(invoice, customer) => {
+                if (!invoice) return;
+                const matchedCustomer = customer || customers.find((item) => item.name === invoice.customer || item.whatsapp === invoice.phone) || customers[0];
+                const invoiceNumber = invoice.number || invoice.invoiceNumber || "—";
+                const companyName = matchedCustomer?.companyName || matchedCustomer?.name || invoice.customer || "Business";
+                sendMockWhatsAppMessage({
+                  customerId: matchedCustomer?.id,
+                  invoiceId: invoice?.id,
+                  orderId: invoice?.id,
+                  customerName: matchedCustomer?.primaryContact || matchedCustomer?.name || invoice.customer || "Customer",
+                  companyName,
+                  phone: matchedCustomer?.whatsapp || invoice.phone || "+91 00000 00000",
+                  invoiceNumber,
+                  orderNumber: invoiceNumber,
+                  template: "Invoice delivery",
+                });
+              }}
+            />
           )}
         </main>
       </div>
@@ -1460,7 +1779,20 @@ function Billing({ invoices, products, product, cur, shop, onShop, metrics, onCr
 
       {creating && <NewInvoiceModal products={products} cur={cur} onClose={() => setCreating(false)}
         onSave={(inv) => { const rec = onCreate(inv); setCreating(false); setViewing(rec); }} />}
-      {viewing && <InvoiceView invoice={viewing} product={product} cur={cur} shop={shop} onClose={() => setViewing(null)} />}
+      {viewing && <InvoiceView invoice={viewing} product={product} cur={cur} shop={shop} onClose={() => setViewing(null)} onSendWhatsApp={() => {
+        const customer = customers.find((item) => item.name === viewing.customer || item.whatsapp === viewing.phone) || customers[0];
+        sendMockWhatsAppMessage({
+          customerId: customer?.id,
+          invoiceId: viewing?.id,
+          orderId: viewing?.id,
+          customerName: customer?.primaryContact || customer?.name || viewing.customer || "Customer",
+          companyName: customer?.companyName || customer?.name || viewing.customer || "Business",
+          phone: customer?.whatsapp || viewing.phone || "+91 00000 00000",
+          invoiceNumber: viewing.number,
+          orderNumber: viewing.number,
+          template: "Invoice delivery",
+        });
+      }} />}
       {editingShop && <ShopModal shop={shop} onClose={() => setEditingShop(false)} onSave={(s) => { onShop(s); setEditingShop(false); }} />}
     </div>
   );
@@ -1583,7 +1915,7 @@ function Row({ label, value, muted }) {
   );
 }
 
-function InvoiceView({ invoice, product, cur, shop, onClose }) {
+function InvoiceView({ invoice, product, cur, shop, onClose, onSendWhatsApp }) {
   const t = invoiceTotals(invoice);
   const fmt = (n) => cur + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
@@ -1592,7 +1924,8 @@ function InvoiceView({ invoice, product, cur, shop, onClose }) {
       <div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl ring-1 ring-slate-900/5">
         <div className="no-print flex items-center justify-between border-b border-slate-100 px-6 py-4">
           <h3 className="text-base font-semibold text-slate-900">{invoice.number}</h3>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <button onClick={() => onSendWhatsApp?.()} className="inline-flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-700 hover:bg-emerald-100"><MessageCircle size={15} /> Send via WhatsApp</button>
             <button onClick={() => window.print()} className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-800"><Printer size={15} /> Print</button>
             <button onClick={onClose} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600"><X size={18} /></button>
           </div>
