@@ -45,14 +45,16 @@ const defaultShopState = {
 
 function getDefaultStockroomState() {
   return {
+    // New/reset StockRoom starts as a genuinely blank canvas.
+    // Rudrani Collection remains the shop identity.
     currency: "₹",
-    suppliers: seedSuppliers,
-    products: seedProducts,
-    movements: seedMovements,
-    pos: seedPOs,
-    invoices: seedInvoices,
-    customers: seedCustomers,
-    leads: seedLeads,
+    suppliers: [],
+    products: [],
+    movements: [],
+    pos: [],
+    invoices: [],
+    customers: [],
+    leads: [],
     shop: defaultShopState,
     whatsapp: getDefaultWhatsAppState(),
   };
@@ -717,7 +719,7 @@ export default function App() {
   }
 
   async function handleResetAllData() {
-    if (!window.confirm("Clear ALL saved data on this device (products, invoices, leads, everything) and start fresh with sample data? This cannot be undone.")) {
+    if (!window.confirm("Clear ALL saved data for Rudrani Collection (products, invoices, leads, everything) and start with a blank StockRoom? This cannot be undone.")) {
       return;
     }
 
